@@ -3,27 +3,23 @@ import os
 import time
 
 import numpy as np
-import requests
 from tqdm import tqdm
+
+from loguru import logger as eval_logger
+
+from lmms_eval.llm_judge import get_server
+from lmms_eval.llm_judge.protocol import Request, ServerConfig
 
 API_TYPE = os.getenv("API_TYPE", "openai")
 
-if API_TYPE == "openai":
-    API_URL = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
-    API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-elif API_TYPE == "azure":
-    API_URL = os.getenv("AZURE_ENDPOINT", "https://api.cognitive.microsoft.com/sts/v1.0/issueToken")
-    API_KEY = os.getenv("AZURE_API_KEY", "YOUR_API_KEY")
-    headers = {
-        "api-key": API_KEY,
-        "Content-Type": "application/json",
-    }
 
-from loguru import logger as eval_logger
+def _call_judge(prompt, model="gpt-4", max_tokens=16, retries=3):
+    """Call the LLM judge via the llm_judge framework."""
+    config = ServerConfig(model_name=model, max_tokens=max_tokens, num_retries=retries, temperature=0.0)
+    judge = get_server(API_TYPE, config)
+    request = Request(messages=[{"role": "user", "content": prompt}], config=config)
+    response = judge.evaluate(request)
+    return response.content
 
 
 def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4", load_json=False, save_json_path="./hallusion_output.json", retries=3):
@@ -32,9 +28,9 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
             output = json.load(f)
     else:
         output = []
-    for sample in tqdm(data[len(output) :], desc="Eval by GPT"):
+    for sample in tqdm(data[len(output):], desc=f"Eval by LLM ({API_TYPE})"):
         prompt = "Imagine you are an intelligent teacher. Thoroughly read the question, reference answer and the prediction answer to ensure a clear understanding of the information provided. Assess the correctness of the predictions. "
-        prompt += 'If the prediction answer does not conflict with the reference answer, please generate “correct”. If the prediction answer conflict with the reference answer, please generate “incorrect”. If the prediction answer is unclear about the answer, please generate "unclear". \n\n Question:'
+        prompt += 'If the prediction answer does not conflict with the reference answer, please generate "correct". If the prediction answer conflict with the reference answer, please generate "incorrect". If the prediction answer is unclear about the answer, please generate "unclear". \n\n Question:'
         prompt += sample["question"]
         prompt += "\nReference answer: "
         prompt += sample["gt_answer_details"]
@@ -42,31 +38,10 @@ def evaluate_by_chatgpt(data, output_entry, correctness_entry, gpt_model="gpt-4"
         prompt += sample[output_entry]
         prompt += "\nOutput:"
 
-        # https://github.com/openai/openai-python/issues/322#issuecomment-1767841683
-        for attempt in range(retries):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                payload = {
-                    "messages": messages,
-                    "max_tokens": 16,
-                }
-                # set model when using openai api_key. Azure api_key does not need model since the endpoint fixed the model.
-                if API_TYPE == "openai":
-                    payload["model"] = gpt_model
-                response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-                response.raise_for_status()
-                response = response.json()
-                break
-            except Exception as e:
-                eval_logger.info(f"Attempt {attempt + 1} failed with error: {str(e)}")
-                if attempt < retries - 1:  # If we have retries left, sleep and then continue to next attempt
-                    time.sleep(5)
-                else:  # If this was the last attempt, log and return empty
-                    eval_logger.error(f"All {retries} attempts failed. Last error message: {str(e)}")
         try:
-            output_text = response["choices"][0]["message"]["content"]
+            output_text = _call_judge(prompt, gpt_model, max_tokens=16, retries=retries)
         except Exception as e:
-            eval_logger.info(f"Get error {str(e)} when extracting response")
+            eval_logger.error(f"All {retries} attempts failed. Last error message: {str(e)}")
             output_text = "unclear"
 
         if "incorrect" in output_text.lower():
@@ -96,50 +71,23 @@ def check_same_by_chatgpt(data, output_entry, gpt_model="gpt-4", load_json=False
             key = "_".join([r["category"], r["subcategory"], str(r["set_id"]), str(r["question_id"])])
             orig_response[key] = r[output_entry]
 
-    for sample in tqdm(data, desc="Check same by GPT"):
+    for sample in tqdm(data, desc=f"Check same by LLM ({API_TYPE})"):
         if "same" not in sample.keys():
             key = "_".join([sample["category"], sample["subcategory"], str(sample["set_id"]), str(sample["question_id"])])
             response2 = orig_response[key]
 
             prompt = "Imagine you are an intelligent teacher. Thoroughly read the two responses to two different questions. Assess the consistency of the information provided within those two responses. "
             prompt += "You do not know the specific questions, but you can asssess the consistency among the two responses by checking for logical conflicts if both responses are correct. "
-            prompt += 'If response1 does not conflict with response2, please generate “same”. Otherwise, generate "different". \n\n response1:'
+            prompt += 'If response1 does not conflict with response2, please generate "same". Otherwise, generate "different". \n\n response1:'
             prompt += sample[output_entry]
             prompt += "\nresponse2: "
             prompt += response2
             prompt += "\nOutput:"
 
-            # https://github.com/openai/openai-python/issues/322#issuecomment-1767841683
-            for attempt in range(retries):
-                try:
-                    headers = {
-                        "api-key": API_KEY,
-                        "Content-Type": "application/json",
-                    }
-
-                    messages = [{"role": "user", "content": prompt}]
-
-                    payload = {
-                        "model": gpt_model,
-                        "messages": messages,
-                        "max_tokens": 16,
-                    }
-                    response = requests.post(API_URL, headers=headers, json=payload)
-                    response.raise_for_status()
-                    response = response.json()
-
-                    break
-                except Exception as e:
-                    eval_logger.info(f"Attempt {attempt + 1} failed with error: {str(e)}")
-                    if attempt < retries - 1:  # If we have retries left, sleep and then continue to next attempt
-                        time.sleep(5)
-                    else:  # If this was the last attempt, log and return empty
-                        eval_logger.error(f"All {retries} attempts failed. Last error message: {str(e)}")
-
             try:
-                output_text = response["choices"][0]["message"]["content"]
+                output_text = _call_judge(prompt, gpt_model, max_tokens=16, retries=retries)
             except Exception as e:
-                eval_logger.info(f"Get error {str(e)} when extracting response")
+                eval_logger.error(f"All {retries} attempts failed. Last error message: {str(e)}")
                 output_text = "different"
 
             gpt_same = "0"
@@ -278,20 +226,6 @@ def get_eval_pair_all(data, model_correctness_entry):  # per question pair
     eval_all_pair_stat["LH_cg"] = lh_counter
     eval_all_pair_stat["VI_cg"] = vi_counter
     eval_all_pair_stat["Mix_cg"] = both_counter
-
-    # for v in get_eval_pair_dict.values():
-    #     if v[0] == v[1]:
-    #         eval_all_pair_stat["correct"] += 1
-    #     else:
-    #         eval_all_pair_stat["wrong"] += 1
-
-    # for v in get_analysis_pair_dict.values():
-    #     if v[0] > 0 and v[1] > 0:
-    #         eval_all_pair_stat["Mix"] += 1
-    #     elif v[0] > 0:
-    #         eval_all_pair_stat["LH"] += 1
-    #     elif v[1] > 0:
-    #         eval_all_pair_stat["VI"] += 1
 
     for k in get_eval_pair_dict.keys():
         v = get_eval_pair_dict[k]
